@@ -18,8 +18,8 @@ export const statsBlockSchema: Template = {
 	],
 	ui: {
 		defaultItem: {
-			title: 'TinaCMS by the numbers',
-			description: 'An open-source, Git-backed CMS.',
+			title: 'By the numbers',
+			description: 'A few figures worth calling out.',
 			stats: [ { stat: '12K', type: 'Stars on GitHub' }, { stat: '11K', type: 'Active Users' }, { stat: '22K', type: 'Powered Apps' } ],
 		},
 	},

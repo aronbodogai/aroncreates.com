@@ -29,7 +29,7 @@ export const heroBlockSchema: Template = {
 	ui: {
 		defaultItem: {
 			tagline: "Here's some text above the other text",
-			headline: 'Astro + TinaCMS, ready to ship',
+			headline: 'A headline for this page',
 			starfield: true,
 		},
 	},

@@ -53,18 +53,14 @@ node_modules/
 # Astro
 .astro
 
-# TODO: After scaffolding from this template, DELETE the block below so your
-# chosen lockfile (we recommend pnpm-lock.yaml) is committed. See README → "Commit your lockfile".
-# Package Manager Lock Files
+# Lock files for package managers this project does not use. pnpm-lock.yaml is
+# committed on purpose so Cloudflare Workers Builds installs the same tree.
 package-lock.json
-pnpm-lock.yaml
 yarn.lock
 .yarn/cache
 bun.lockb
 deno.lock
 
 # builds
-.vercel
-.netlify
 .wrangler
 dist

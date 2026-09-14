@@ -7,48 +7,33 @@ import tina from '@tinacms/astro/integration';
 import { tinaAdminDevRedirect } from '@tinacms/astro/vite';
 import tailwindcss from '@tailwindcss/vite';
 
-// Host-neutral: every content page prerenders to static HTML, and the one
-// on-demand route (/tina-island, the visual-editing endpoint) is served by
-// whichever host built the site. Each platform sets its own build env var
-// automatically — nothing to configure — and any other host (including a
-// local `wrangler deploy`) falls back to a portable Node server. Set
-// DEPLOY_ADAPTER to force a specific adapter when no env var applies.
+// Every content page prerenders to static HTML; the one on-demand route
+// (/tina-island, the visual-editing endpoint) needs a server. Cloudflare
+// Workers Builds sets WORKERS_CI, so CI picks the Cloudflare adapter on its
+// own. Everything else — local `astro build`, `astro preview` — falls back to
+// a portable Node server. Set DEPLOY_ADAPTER to force one.
 async function getAdapter() {
-	const vercel = async () => (await import('@astrojs/vercel')).default();
 	const cloudflare = async () => (await import('@astrojs/cloudflare')).default();
-	const netlify = async () => (await import('@astrojs/netlify')).default();
 	const nodeStandalone = async () =>
 		(await import('@astrojs/node')).default({ mode: 'standalone' });
 
 	switch (process.env.DEPLOY_ADAPTER) {
-		case 'vercel': return vercel();
 		case 'cloudflare': return cloudflare();
-		case 'netlify': return netlify();
 		case 'node': return nodeStandalone();
 		case undefined: break; // no override -> auto-detect below
 		default:
 			console.warn(`[astro.config] Unknown DEPLOY_ADAPTER "${process.env.DEPLOY_ADAPTER}" - ignoring and auto-detecting.`);
 	}
-	if (process.env.VERCEL) return vercel();
-	// CF_PAGES = Cloudflare Pages CI; WORKERS_CI = Cloudflare Workers Builds CI.
-	if (process.env.WORKERS_CI || process.env.CF_PAGES) return cloudflare();
-	if (process.env.NETLIFY) return netlify();
+	if (process.env.WORKERS_CI) return cloudflare();
 
 	return nodeStandalone();
 }
 
-// Prefer an explicit SITE_URL; otherwise use the URL the platform injects so
-// zero-config deploys still emit absolute URLs (sitemap, RSS, OpenGraph).
-// Cloudflare Workers exposes no such var — set SITE_URL there for correct
-// canonicals. Local builds fall back to localhost.
+// Cloudflare Workers injects no deploy-URL variable, so SITE_URL has to be set
+// in the build environment or the sitemap, RSS, and OpenGraph tags all emit
+// localhost canonicals. Local builds fall back to localhost on purpose.
 function getSiteUrl() {
-	if (process.env.SITE_URL) return process.env.SITE_URL;
-	if (process.env.VERCEL_PROJECT_PRODUCTION_URL) return `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
-	if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
-	if (process.env.CF_PAGES_URL) return process.env.CF_PAGES_URL;
-	if (process.env.NETLIFY && process.env.URL) return process.env.URL;
-
-	return 'http://localhost:4321';
+	return process.env.SITE_URL ?? 'http://localhost:4321';
 }
 
 // https://astro.build/config

@@ -3,22 +3,14 @@ import { BlogCollection } from "./collections/blog";
 import { GlobalConfigCollection } from "./collections/global-config";
 import { PageCollection } from "./collections/page";
 
-// Your hosting provider likely exposes this as an environment variable
-const branch =
-  process.env.GITHUB_BRANCH ||
-  process.env.VERCEL_GIT_COMMIT_REF ||
-  process.env.WORKERS_CI_BRANCH || // Cloudflare Workers Builds
-  process.env.CF_PAGES_BRANCH || // Cloudflare Pages
-  process.env.HEAD || // Netlify
-  "main";
+const branch = process.env.WORKERS_CI_BRANCH || "main";
 
+// No `clientId`/`token`: this site has no hosted CMS backend. The admin UI is
+// built and served only by `pnpm dev` on a machine that has the repo, and
+// `pnpm strip-admin` deletes it from `dist` so it never reaches production.
+// Editing is local, and publishing is a git push.
 export default defineConfig({
   branch,
-
-  // Get this from tina.io
-  clientId: process.env.PUBLIC_TINA_CLIENT_ID,
-  // Get this from tina.io
-  token: process.env.TINA_TOKEN,
 
   build: {
     outputFolder: "admin",

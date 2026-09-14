@@ -25,7 +25,7 @@ export const ctaBlockSchema: Template = {
 	ui: {
 		defaultItem: {
 			title: 'Start Building',
-			description: 'Get started with TinaCMS today and take your content management to the next level.',
+			description: 'A short line that tells the reader what to do next.',
 			actions: [
 				{ label: 'Get Started', type: 'button', link: '/' },
 				{ label: 'Book Demo', type: 'link', link: '/' },

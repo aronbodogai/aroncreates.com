@@ -1,8 +1,16 @@
 {
-	// Cloudflare config — only read when deploying to Cloudflare Pages/Workers;
-	// other hosts ignore this file. `nodejs_compat` exposes `node:async_hooks`,
-	// which the Tina visual-editing island route (AsyncLocalStorage) needs.
-	"name": "tina-astro-starter",
+	// Cloudflare config — only read when deploying to Cloudflare Workers; other
+	// hosts ignore this file. `nodejs_compat` exposes `node:async_hooks`, which
+	// the Tina visual-editing island route (AsyncLocalStorage) needs.
+	//
+	// Deliberately no `main`/`assets` keys: @astrojs/cloudflare builds through
+	// @cloudflare/vite-plugin, which resolves `main` while *setting up* the
+	// build and fails if it does not exist yet — and `main` is the build's own
+	// output. The adapter wires the worker entry and asset directory itself.
+	"name": "aroncreates-com",
 	"compatibility_date": "2026-06-01",
-	"compatibility_flags": ["nodejs_compat"]
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": {
+		"enabled": true
+	}
 }

@@ -1,0 +1,37 @@
+---
+title: Server changelog 2025.09.23
+description: Domain move, modpack bump, and a docker-compose startup script I keep meaning to automate.
+pubDate: 2025-09-23T00:00:00.000Z
+---
+
+Changes to the home server this round.
+
+## Done
+
+- Moved the game server to `game.aroncreates.com`.
+- Updated the modpack to 1.3.1.
+- Set `"userland-proxy": false` in the Docker daemon config.
+
+## Not done
+
+Disabling the random source port on the router is a dead end — the router does
+not support it.
+
+## Next
+
+A single startup script, so the stacks come up in one command instead of three.
+Current draft:
+
+```bash
+# plex stack
+sudo modprobe vgem
+cd /mnt/b/repos/ultimate-plex-stack && sudo docker compose up -d
+
+# factorio
+cd /mnt/b/repos/factorio-docker && sudo docker compose up -d
+
+# minecraft
+cd /mnt/b/repos/docker-minecraft-server && sudo docker compose up -d
+```
+
+After that: automated offsite backups.
