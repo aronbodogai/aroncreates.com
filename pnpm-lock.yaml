@@ -84,6 +84,9 @@ importers:
       vite:
         specifier: ^7.3.2
         version: 7.3.6(@types/node@25.9.6)(jiti@1.21.7)(lightningcss@1.32.0)(yaml@2.9.1)
+      wrangler:
+        specifier: ^4.131.2
+        version: 4.131.2(@types/node@25.9.6)
 
 packages:
 
