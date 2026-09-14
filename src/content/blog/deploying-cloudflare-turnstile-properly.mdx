@@ -1,0 +1,675 @@
+---
+title: Deploying Cloudflare Turnstile properly
+description: What a CAPTCHA actually buys you, how Turnstile is meant to be wired up, what skipping server-side validation concretely enables for an attacker, and the checklist I run when reviewing someone else's integration.
+pubDate: 2026-09-14T00:00:00.000Z
+---
+
+Almost every Turnstile integration I have reviewed was broken in the same way:
+the widget rendered, the form submitted, nobody noticed that the server never
+looked at the token. The page *feels* protected. It is not. This is the
+background and the checklist I use so that stops happening.
+
+## What a CAPTCHA is actually for
+
+A CAPTCHA is not an authentication control and it is not a rate limiter. It is a
+cost control. It makes each attempt against an endpoint more expensive for an
+automated client than for a human one, so that attacks which only work at volume
+stop being worth running.
+
+That framing matters, because it tells you what a CAPTCHA does not do:
+
+- It does not stop a determined attacker making a handful of requests.
+- It does not stop a solver farm, which pays humans cents per token.
+- It does not authorise anything. A valid token proves "a browser session
+  somewhere solved a challenge", not "this user may perform this action".
+
+So it belongs *in front of* abuse-prone, unauthenticated, side-effecting
+endpoints — signup, login, password reset, contact forms, coupon redemption,
+free-tier resource creation — layered with rate limiting and authorisation, not
+instead of them.
+
+## Where Turnstile fits
+
+Turnstile is Cloudflare's CAPTCHA replacement. Instead of asking the user to
+identify traffic lights, it runs a set of browser challenges — proof-of-work,
+proof-of-space, probes of browser APIs and behaviour — and issues a signed token
+if it is satisfied. Most visitors see a checkbox or nothing at all.
+
+The flow has two halves, and the second half is the one people skip:
+
+1. **Client side.** The widget runs in the visitor's browser and produces a
+   token.
+2. **Server side.** Your backend posts that token to Cloudflare's `siteverify`
+   endpoint with your secret key and gets a verdict.
+
+The token is opaque to you. It carries no meaning until `siteverify` tells you
+what it means. A client that never calls `siteverify` has deployed a decorative
+checkbox.
+
+Three widget modes, set when you create the widget:
+
+- **Managed** — Cloudflare decides whether to show an interaction. The default,
+  and the right answer unless you have a reason.
+- **Non-interactive** — visible widget, never asks for a click.
+- **Invisible** — no widget shown at all.
+
+Invisible looks attractive and is usually a mistake: when a visitor is blocked
+they get no widget, no error, and no way to understand why the form will not
+submit. Managed degrades better.
+
+## Deploying it
+
+### 1. Create the widget
+
+In the Cloudflare dashboard under Turnstile, create a widget scoped to the exact
+hostnames it will run on. You get a **sitekey** (public, goes in your HTML) and a
+**secret key** (private, never leaves your server).
+
+Add every hostname the widget legitimately runs on — production, staging, preview
+deployments. The list is one of the few things stopping someone embedding your
+sitekey on their own site and farming tokens, so it is worth understanding how it
+matches. Wildcards are rejected in the hostname field, which reads as strict, but
+an entry authorises that host *and everything beneath it*: `example.com` covers
+`www.`, `shop.`, your user-content host, and the stale CNAME nobody has cleaned
+up. Matching is on label boundaries, so `example.com` does not cover
+`notexample.com`. Add the narrowest hosts that work, and remember `localhost` if
+you added it for development.
+
+### 2. Render the widget
+
+Implicit rendering, for a form that exists at page load:
+
+```html
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+
+<form method="POST" action="/subscribe">
+  <input type="email" name="email" required />
+  <div
+    class="cf-turnstile"
+    data-sitekey="YOUR_SITEKEY"
+    data-action="subscribe"
+    data-theme="auto"
+  ></div>
+  <button type="submit">Subscribe</button>
+</form>
+```
+
+Turnstile injects a hidden input named `cf-turnstile-response` into the
+surrounding form. That is the token your handler reads.
+
+Explicit rendering, for a SPA or a form that appears later:
+
+```js
+const widgetId = turnstile.render("#turnstile-container", {
+  sitekey: "YOUR_SITEKEY",
+  action: "subscribe",
+  callback: (token) => submit(token),
+  "error-callback": () => showError("Verification unavailable. Try again."),
+  "expired-callback": () => turnstile.reset(widgetId),
+});
+```
+
+Set `action` to a short string naming the thing being protected. It is echoed
+back in the verify response, and checking it is what stops a token minted on your
+cheap newsletter form being replayed against your password reset endpoint.
+
+### 3. Verify on the server
+
+```js
+async function verifyTurnstile(token, remoteip, env) {
+  const body = new FormData();
+  body.append("secret", env.TURNSTILE_SECRET_KEY);
+  body.append("response", token);
+  body.append("remoteip", remoteip);
+  body.append("idempotency_key", crypto.randomUUID());
+
+  const res = await fetch(
+    "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+    { method: "POST", body },
+  );
+  return res.json();
+}
+
+export default {
+  async fetch(request, env) {
+    const form = await request.formData();
+    const token = form.get("cf-turnstile-response");
+    if (!token) return new Response("Verification required", { status: 403 });
+
+    const outcome = await verifyTurnstile(
+      token,
+      request.headers.get("CF-Connecting-IP"),
+      env,
+    );
+
+    if (
+      !outcome.success ||
+      outcome.action !== "subscribe" ||
+      !ALLOWED_HOSTNAMES.has(outcome.hostname)
+    ) {
+      return new Response("Verification failed", { status: 403 });
+    }
+
+    // Only now do the thing.
+    return handleSubscribe(form);
+  },
+};
+```
+
+The response shape:
+
+| Field | Meaning |
+| --- | --- |
+| `success` | Boolean verdict |
+| `challenge_ts` | ISO 8601 timestamp the challenge was solved |
+| `hostname` | Hostname the widget was served on |
+| `action` | The `action` you set client side |
+| `cdata` | The `cData` you set client side |
+| `error-codes` | Why it failed |
+
+Rules the API enforces for you: tokens are valid for **300 seconds**, are
+**single use**, and are at most 2048 characters. `timeout-or-duplicate` means
+expired or already redeemed — treat it as a failure, not a retry.
+
+`idempotency_key` exists so a network-level retry of one verification does not
+come back as a duplicate. Mint it fresh with `crypto.randomUUID()` at the top of
+the handler and hold it only across that attempt's retry loop. Never derive it
+from the token, the body, or a user ID — see below for why that one matters.
+
+## What skipping server-side validation actually enables
+
+### The probe: the attack and the test are the same request
+
+Start here, because it produces a fact about production in about a minute, and
+because the attacker's first move and your first test are the same HTTP request.
+
+Submit the form once in a real browser with devtools open. Right-click the
+request, Copy as cURL. Now re-send it four ways, changing only the token:
+
+1. Delete the `cf-turnstile-response` field.
+2. Send it empty.
+3. Send a well-formed but bogus value.
+4. Solve once in a browser, then submit that same token twice inside 300 seconds.
+
+Grade on the **side effect** — row created, mail sent — never on the HTTP status,
+because handlers routinely return a friendly 200 while doing the work anyway.
+Probes 1–3 must produce no side effect. Probe 4 must succeed at most once.
+
+Three things to be careful about. Copy the real request rather than hand-rolling
+a curl, or you also drop cookies, the CSRF token and `Origin`, and a rejection
+tells you nothing about Turnstile. Probe 4 is only clean inside the token
+lifetime, since an expired token and a replayed one both come back
+`timeout-or-duplicate`. And if the handler passes an `idempotency_key`, a
+successful repeat can be documented-correct behaviour rather than a finding —
+check for that parameter before you call it.
+
+The probe is not free, either. Its success signal is a second real signup or a
+second real email. Run it against something you own.
+
+### The baseline: four things that look like validation and are not
+
+When the backend never calls `siteverify`, the token field is inert. The attacker
+reads the form's action and field names once, then loops:
+
+```bash
+curl -X POST https://target/subscribe \
+  -d 'email=a@b.c' -d 'cf-turnstile-response=x'
+```
+
+No browser is ever opened. The widget, the challenge and the token minting all
+happened somewhere the attacker simply is not. Cloudflare says this in as many
+words on the validation page: tokens can be forged, and an attacker can submit
+any string to your form endpoint without completing a challenge.
+
+One scoping caveat, because the universal version of this claim is wrong: it
+holds for an origin-handled form. If you have Turnstile pre-clearance enabled *and* a
+WAF rule requiring the `cf_clearance` cookie, Cloudflare's edge drops unsolved
+requests before your origin ever sees them. That is the one configuration where a
+missing `siteverify` call is not a full bypass — and it is rare, because
+pre-clearance requires the widget's hostname to be a zone in your account.
+
+Four half-measures that pass a code review and stop nothing:
+
+- **Presence.** `if (!token) return 403` followed by no verification is defeated
+  by `-d 'cf-turnstile-response=x'`. It filters the accidental empty submit and
+  nothing else. It is the most seductive of these because there *is* an
+  if-statement mentioning the token.
+- **Shape.** Asserting the value starts with `0.`, or falls in a plausible length
+  band, or matches a base64-ish regex. Shape is not a cryptographic property.
+  Cloudflare publishes no key or JWKS for local verification; `siteverify` is the
+  only oracle, because only it holds your secret.
+- **Decoding it.** The token is opaque. It is not a JWT and there is no readable
+  payload to trust. Anything you think you parsed out of it, you invented.
+- **Client-side gates.** A submit button that JS enables after the callback, a
+  handler gating on `turnstile.getResponse()` being truthy. All of it runs in the
+  attacker's environment, and the attacker is not running your JavaScript.
+  `getResponse()` proves a challenge was solved *in that tab*. It says nothing
+  about the bytes arriving at your server.
+
+The last one is worse than having nothing, because a visible, working widget
+convinces the team the endpoint is defended and discourages anyone from adding
+the check.
+
+### What that buys the attacker
+
+Organise this by what your endpoint actually does, not by which OWASP name it
+has. All of these need volume — which is exactly what the CAPTCHA was supposed to
+make expensive.
+
+**It logs someone in.** Credential stuffing (OAT-008) is testing, not guessing:
+published success rates sit around 0.1–2%, so a run only pays at very large
+attempt counts. Unenforced, that is one POST per pair across a proxy pool. And if
+your answer to stuffing is aggressive lockout, the attacker skips cracking
+entirely and just fails N times per harvested username to lock the population
+out — at a five-failure threshold, locking 100,000 accounts is 500,000 requests.
+OWASP's escape from that squeeze is to let the forgotten-password flow log a user
+in even while the account is locked.
+
+**Its response varies with account existence.** Login, signup and reset are all
+account-existence oracles, and an oracle only pays across millions of queries.
+The tells are not just error strings: response length, status code, redirect
+target, `Set-Cookie` presence, and timing — an existing account runs argon2 while
+an unknown one short-circuits, unless you also hash a dummy value.
+
+**It sends mail to an address the requester chose.** Password reset, magic link,
+invite, contact autoresponder. This is subscription bombing, and the canonical
+wave is well documented: Spamhaus recorded over 1,000 subscription requests per
+minute, 22,000 signups at a single ESP across 3,000 domains, nine addresses
+signed up over 9,000 times in two weeks generating 81,000 confirmation emails,
+and over 100 US government addresses rendered useless for a considerable time.
+Confirmed opt-in did not save the participating senders — the confirmation volume
+*was* the attack. Spamhaus's stated remedy was CAPTCHA plus COI, which is exactly
+the control being nullified.
+
+Note what is actually being stolen: your sending reputation. That mail leaves
+your ESP's IPs, is DKIM-signed by you, aligns with SPF and passes your DMARC —
+the authentication stack gives no signal because it correctly attests that you
+really sent it. Then the bill arrives late and reputationally: attacker-supplied
+address lists are seeded with spamtraps, complaint rates spike because real
+people who never signed up hit "spam", and your receipts, resets and OTP mail
+start landing in junk for paying customers.
+
+**It sends an SMS.** SMS pumping bills you directly. The fraudster submits blocks
+of adjacent numbers on a network that revenue-shares with them, and picks
+expensive international routes to multiply the take. Unenforced, it is one POST
+per paid message. The cheapest alarm, per Twilio: fraudulent OTP traffic never
+completes the verification cycle, so watch the send-to-verify ratio.
+
+**It calls something metered.** Inference, geocoding, OCR, transcoding, egress.
+One unauthenticated request triggers a billed third-party call — OWASP's
+LLM10:2025 Unbounded Consumption names this Denial of Wallet, and with an LLM
+endpoint the attacker also controls cost per request by maximising input and
+output length. The outage and the invoice arrive together, because exhausting the
+upstream's rate limit takes the feature down for real users.
+
+**It checks a code.** Coupon and voucher enumeration is OAT-002. Feasibility is
+set by entropy alone: `SUMMER-xxxx` over four alphanumerics is about 1.7 million
+candidates and falls in hours unthrottled, while a 16-digit random gift card does
+not — a check digit only cuts the space by 10×. Short, human-typable codes were
+always secured by the assumption that attempts are expensive.
+
+**It authorises a payment.** Card testing (OAT-001) favours low-value donation
+forms and card-add flows, where amounts are small or arbitrary and nobody is
+watching. You absorb per-authorisation gateway fees across tens of thousands of
+attempts, then chargebacks and their fees, then a chargeback ratio that can pull
+you into card-scheme monitoring programmes, higher rates, reserves, or loss of
+the merchant account.
+
+**It holds inventory.** Denial of inventory (OAT-021) depletes stock without
+completing the purchase, and holds are cheap because they usually need no payment
+instrument. I would *not* put scalping in this list: a scalper is low-volume and
+high-margin, pays a fraction of a cent per solve and can pre-mint tokens inside
+the 300-second window, so a correctly enforced Turnstile barely inconveniences
+them. Claiming it does undercuts the rest of the argument.
+
+There is a quieter loss too. The `siteverify` response is telemetry, not a
+boolean: `challenge_ts`, `hostname`, `action`, your `cdata`, `error-codes`. A
+cosmetic integration loses the evidence along with the block.
+
+### Validation that is present but inverted
+
+**`res.ok` instead of `success`.** Probing the live endpoint, a missing or empty
+`response` returns HTTP 200 with `{"success":false,"error-codes":["missing-input-response"]}`;
+a junk token returns 200 with `invalid-input-response`; a spent token returns 200
+with `timeout-or-duplicate`. Only secret-level errors (400) and wrong method
+(405) escape 200. So code gating on `res.ok` passes every forged token,
+permanently. The nasty part is that it *does* catch a broken secret, via those
+400s — so it appears to work right up until the moment it matters. Those status
+codes are observed behaviour, not a documented contract, which is one more reason
+the rule is: parse the body, check `success`, and never let a status code decide
+allow or deny.
+
+**Fail-open `catch`.** Cloudflare's own reference handlers fail closed — every
+language sample returns `{success:false, "error-codes":["internal-error"]}` from
+the catch, and the timeout example returns `{success:false}` on abort. But the
+best-practice list tells you to set timeouts, retry, and "have fallback behavior
+for API failures" without ever saying the fallback must be rejection. Decide it
+explicitly.
+
+An attacker does not need to solve a challenge if they can stop it happening.
+`challenges.cloudflare.com` is a third-party origin whose reachability the client
+controls: block it at DNS, or never load `api.js`. Turnstile reports this as
+`200500` (iframe could not load), with `110600` and `110620` for the timeout
+cases. Then two decisions of yours settle it — whether `error-callback` quietly
+re-enables submit, and whether the server's catch falls through. Most of the
+time the attacker does not even have to induce the failure. They just have to
+notice you already fail open.
+
+Note that the garbage-token probe above does *not* detect this variant, because a
+garbage token produces a clean 200 failure rather than an exception. Fault
+injection does: point the handler at an unroutable address and watch what the
+endpoint does.
+
+**Verify after the side effect.** Sending the email, creating the row, charging
+the card, and *then* checking the token means the 403 is cosmetic. The attacker
+already has what they came for, and `timeout-or-duplicate` is now a log line
+rather than a control.
+
+**The always-pass test secret in production.** If `1x0000000000000000000000000000000AA`
+reaches prod through a `NODE_ENV` fallback, `siteverify` *is* called and `success`
+*is* checked, and the endpoint is still fully open: it returns `success:true` for
+`notatoken`, `a`, `0`, `null`, and does not spend them, so replays pass too. It
+is the no-validation outcome wearing the costume of correct validation, which is
+why it survives a review that only asks "do we call siteverify and read success".
+It is cheap to catch, though: test-key responses carry a synthetic
+`"hostname":"example.com"` and `"metadata":{"result_with_testing_key":true}`, so
+comparing the returned hostname against your own domain turns it into a caught
+bug. The one input it does reject is an absent or empty token.
+
+### The route you forgot
+
+Turnstile lands on the door that has a form on it. The same business logic is
+usually reachable through others: the legacy `/api/v1` route still mounted for an
+old client, the GraphQL mutation wrapping the same resolver, the server action
+sitting next to the REST handler.
+
+Above all, the native-mobile exemption. The widget cannot render in a native
+client, someone needs iOS signup to work, and the exemption ships as a header
+check, a user-agent check, or an unprotected route — all of which are one curl
+away. Cloudflare's own conditional-enforcement tutorial hands you the shape of
+this (`x-bypass-turnstile: VerySecretValue`), and a static header value is a
+replayable secret sitting in a binary anyone can pull apart.
+
+A client that cannot solve a challenge needs its own authentication, not an
+exemption. On mobile that is Play Integrity or App Attest — a different control,
+not a Turnstile setting.
+
+### Single-use, deleted by your own code
+
+Cloudflare enforces single-use at redemption. Two common patterns hand it back.
+
+**A verification cache keyed on the token.** Cloudflare's advice to cache the
+result is scoped to one request reading the verdict twice — middleware plus
+handler. Implemented as a cross-request memo (`redis.get('ts:' + token)`, a
+module-level `Map`, a Worker global, an ORM query cache), the first replay never
+reaches Cloudflare and every later one short-circuits to a cached success. Any
+TTL does it: even five minutes, matching the token window, turns one solve into
+thousands of submissions. The cache also swallows the `timeout-or-duplicate`
+signal, so the dashboard stays clean. Scope a verification memo to a single
+request's lifetime, never to a shared store keyed by token.
+
+**`idempotency_key` derived from the token.** `uuidv5(token)` or `sha256(token)`
+makes a genuine replay byte-identical to a retry: the attacker resubmits the
+spent token, you derive the same key, and `siteverify` returns the memoised
+`success: true` instead of the duplicate error — for the undocumented lifetime of
+that record. (A hardcoded constant key is a different and undocumented failure,
+not a stronger version of this one. Don't do that either.)
+
+**Carrying the token forward.** Stashing it in the session, echoing it into a
+hidden field, or returning it to the client for a follow-up call makes it a
+bearer credential with a lifetime you invented — and then forces a second bad
+choice at redemption: re-verify and hit `timeout-or-duplicate` (which is what
+pushes people into the two bugs above), or skip verification because "we already
+checked this one". Verify at the step that does the work. The widget refreshes
+expired tokens by default, so a fresh challenge there is cheap.
+
+### Scope: `hostname` and `action` are reported, not enforced
+
+You cannot send `siteverify` an expected hostname or action. There is no request
+parameter for it and no mismatch error code. Cloudflare reports what it saw and
+assigns the comparison to you, which means `if (!outcome.success) reject()`
+silently accepts a token minted on any allowlisted host for any purpose.
+
+The hostname surface is wider than it looks, for the reason in the deploy section
+above: one entry authorises everything beneath it. So your effective allowlist is
+your whole subdomain estate — user-content hosts serving attacker HTML, stale
+CNAMEs open to takeover, abandoned marketing hosts, preview deployments anyone
+who opens a PR can reach, and `localhost` if it is still in the list. On
+Enterprise, the "Any Hostname" option removes the allowlist entirely.
+
+Do not implement the check as `hostname.endsWith('example.com')`. That reproduces
+the permissive half of Cloudflare's behaviour and adds a bug Cloudflare does not
+have: raw string suffix matching also accepts `notexample.com`. Compare against an
+explicit `Set` of exact hostnames.
+
+For `action`: it is a customer value used to differentiate widgets under the same
+sitekey, up to 32 characters, and it is optional. So a token minted at your cheap
+newsletter widget is portable to `/password-reset` when the action is unset (the
+comparison degenerates to `undefined === undefined`), set to one generic value
+site-wide, or set correctly and never compared. The weakest widget on a sitekey
+sets the protection level for every endpoint sharing it.
+
+Two fixes, in that order. Issue separate sitekey/secret pairs per trust tier —
+then cross-endpoint reuse fails at `siteverify` with `invalid-input-response`,
+structurally. Within a shared sitekey, set a distinct action per widget and
+require an exact match, treating a missing action as a rejection.
+
+### What survives a correct integration
+
+Everything above is your bug. This part is not, and it is the reason the rate
+limits stay.
+
+**Real-browser farms.** The attacker does not bypass Turnstile; they run it. A
+fingerprint-coherent Chromium driven by Playwright behind residential or mobile
+egress loads your actual page, the widget executes, the challenge completes, and
+`cf-turnstile-response` holds a genuine token. Your `siteverify` call returns
+`success:true` with your hostname, your action, a fresh `challenge_ts` and no
+error codes. Nothing is forged, so every check in a textbook-correct integration
+passes. Cloudflare's position is that this is probabilistic on their side: bots
+might complete challenges, but Cloudflare can detect bot-like signals and mark
+the token invalid — which you observe as `success:false` at redemption. What you
+never get is a score or a dial.
+
+**A commodity market.** The solver APIs are uniform: submit the sitekey scraped
+from your page, the page URL, optionally the action and cData, plus a proxy; poll
+and receive a token seconds later. For Turnstile the work behind that API is
+browser-environment automation, not the image-labelling workforce of the
+reCAPTCHA era. I am not quoting per-thousand prices — they move and no defensible
+public figure exists — but the shape is what matters: the attack is rational
+whenever one success is worth more than one token, and you do not set that price.
+The canonical framing of CAPTCHAs as an economic rather than cryptographic
+control is Motoyama et al., USENIX Security 2010, and it has aged well.
+
+**Bearer semantics.** Nothing binds a token to the connection, cookie jar or IP
+that later submits it. `siteverify` requires only `secret` and `response`, and no
+response field binds the token to a client. So a farm solves in one place and
+spends in another, and your edge sees an ordinary-looking request. `remoteip` is
+optional and Cloudflare does not document what happens when it differs from the
+solving client's IP, so treat that as unspecified rather than as a check. Source
+it from `CF-Connecting-IP` or omit it — never from a client-supplied
+`X-Forwarded-For`.
+
+**Pre-minting.** Solving is embarrassingly parallel. Single-use stops one token
+buying two actions; it does not stop a thousand tokens buying a thousand actions
+in the same second. The 300-second window is a scheduling constraint on the farm,
+not a rate limit on the attack.
+
+**It is not a CSRF token.** Flagging this as inference — Cloudflare's docs never
+mention CSRF — but the shape invites the substitution: a per-request opaque
+string in the body looks exactly like a synchroniser token, so teams conclude the
+form is protected and drop the real control. It does not hold, because nothing
+binds the token to the victim's session. The attacker solves the challenge
+themselves, on your real page, then embeds that token in an auto-submitting form
+on a page they control. The victim's browser attaches the victim's cookies. Your
+handler gets `success:true`, your hostname, the expected action, and performs the
+state change as the victim — single-use satisfied, because the token is spent
+exactly once, by the victim. `SameSite=Lax` defaults blunt the classic version,
+which is why this bites in the two cases already discussed: a cookie deliberately
+set `SameSite=None`, or an attacker page on a subdomain of your own registrable
+domain — same-site for cookies, and already authorised to mint tokens.
+
+**Correlation.** The one post-success signal against a farm rotating IPs is
+`metadata.ephemeral_id`, and most readers do not have it: Enterprise Bot
+Management with the Turnstile add-on, or standalone Enterprise Turnstile, enabled
+per widget via the API after your account team grants the entitlement. Design
+against the tutorial's caveat rather than the reference table's "device
+fingerprint ID" label — privacy-focused browsers limit the available signals, so
+multiple legitimate users can share one ephemeral ID. Use it to spot high-volume
+patterns, not to identify devices. The docs' worked threshold starts around three
+signups per hour per ID. On every other plan, velocity limits have to key on your
+own data.
+
+So: a `success:true` attests that some browser environment satisfied the
+challenge scripts on a hostname you authorised, within 300 seconds, not redeemed
+before, declaring an action that same environment chose. That is the whole list.
+It does not attest that a human was present, that the solver is the submitter,
+that the submitter holds any session, or that this party has not done it ten
+thousand times already.
+
+### Collateral from deploying it
+
+Three ways adding Turnstile makes things worse, all avoidable.
+
+**CSP relaxed to make the widget load.** The failure everyone writes about is a
+missing `script-src`/`frame-src` entry for `https://challenges.cloudflare.com`.
+The more common and much worse one is the fix: a team with a strict nonce policy
+on their login page finds the widget broken and adds `'unsafe-inline'`, or
+exempts the route. They have traded XSS protection on their login page for bot
+protection on their login page. Cloudflare documents the right answer — put your
+nonce on the `api.js` tag and Turnstile propagates it to the resources it loads;
+`strict-dynamic` works.
+
+**Validation flooding.** Cloudflare's own error-handling guidance says to rate
+limit against this, and it is concrete: after you add Turnstile, every
+unauthenticated POST, including every garbage one, forces an outbound HTTPS round
+trip before you can say no. On Workers the ceiling is explicit — six simultaneous
+outbound connections per invocation waiting on response headers, plus a subrequest
+cap. At an origin it is the connection pool. This is also the missing mechanism
+that makes fail-open attacker-triggerable: nobody can reach between your server
+and Cloudflare, but they can saturate you until your own calls time out. Order
+the handler accordingly — reject a missing field, an oversize field (>2048), and
+per-IP excess locally, *then* spend the network call.
+
+**Secret key leakage.** The intuitive consequence is wrong, which is why it is
+worth spelling out: the secret redeems tokens, it does not mint them. What a
+leaked secret gives an attacker is a free oracle — they validate tokens against
+`siteverify` without touching your endpoint, so probing costs nothing and leaves
+nothing in your logs. And, inferring from documented single-use rather than from
+documented behaviour, targeted denial of service by token burning: any token they
+can observe (a shared HAR, a proxy body log, a support screenshot) they redeem
+first with your own secret, your redemption returns `timeout-or-duplicate`, and
+the legitimate user's submission fails while reading as replay on your dashboard.
+
+The leak vectors are boring and specific: a `NEXT_PUBLIC_` / `VITE_` / `PUBLIC_`
+prefix inlining the value into the bundle, `[vars]` in a committed
+`wrangler.toml`, a debug error page echoing env. Containment is documented and
+worth knowing before you need it: Cloudflare supports secret rotation, and by
+default the old secret stays valid for two hours so you can swap without an
+outage — which means incident response is `invalidate_immediately: true` and
+accepting the outage, not the comfortable default.
+
+## Reviewing someone else's integration
+
+This is the part I actually get paid for. Run the probe first, then read the code
+in roughly this order — it is how often each one is wrong, not how bad it is.
+
+**Is there a `siteverify` call at all?** Grep the backend. If the only hits are
+in the frontend or in a test, the integration is cosmetic.
+
+**Is the verdict checked, or just the HTTP status?** Look for `res.ok`,
+`response.status`, `raise_for_status`. The verdict lives in the parsed body.
+
+**Does it fail closed?** Read the `catch`, and check whether a timeout is even
+configured. Reject on error.
+
+**Does verification happen before the side effect?** Read top to bottom and find
+the first line that writes, sends or charges.
+
+**Are `hostname` and `action` compared?** Cloudflare reports them; only your code
+enforces them. Exact-match `hostname` against a `Set`, never `endsWith`. Treat a
+missing `action` as a rejection.
+
+**Is the secret real, and is it server-side?** Grep the client bundle and the
+repo for `NEXT_PUBLIC_`, `VITE_`, `PUBLIC_`, and for the dummy keys — grepping
+for `0000000000000000000000000000000AA` catches all three test secrets at once.
+Check the fallback branch of whatever reads the env var.
+
+**Is the `idempotency_key` freshly minted?** If it is `sha256(token)` or similar,
+single-use is gone.
+
+**Is any verification result cached across requests?** A memo keyed on the token
+is the same bug wearing different clothes.
+
+**Is the token being carried forward?** Into the session, a hidden field, or a
+follow-up API call. Verify at the step that does the work instead.
+
+**Is `remoteip` sourced from `CF-Connecting-IP`?** A client-supplied
+`X-Forwarded-For` feeds an attacker-chosen value into verification. Omit the
+parameter rather than pass a bad one.
+
+**Is there a second entrance?** Grep for other routes reaching the same handler
+or resolver, and for any bypass header or user-agent check added for a native
+client.
+
+**Are the error callbacks handled?** `error-callback` firing means no token. If
+the UI quietly re-enables submit, the check is optional in practice.
+
+**Is rate limiting still present?** I have watched teams remove their rate limits
+because "we have a CAPTCHA now". Keep both.
+
+**Does CSP allow the widget — without `'unsafe-inline'`?** Check both what is
+missing and what was loosened to fix it.
+
+One thing a dashboard cannot tell you: Turnstile's challenge-outcome and
+solve-rate panels are incremented when the challenge is issued and completed in
+the visitor's browser. Your server is not a participant in those numbers. Delete
+the `siteverify` call and they look identical the next day — only the Token
+validation panel drops to zero. A green solve rate is evidence that the widget
+loads, and nothing else. Ask for the Token validation panel, or run the probe.
+
+## Testing
+
+Cloudflare publishes dummy keys so tests do not hit real challenges:
+
+| Sitekey | Behaviour |
+| --- | --- |
+| `1x00000000000000000000AA` | Always passes, visible |
+| `2x00000000000000000000AB` | Always fails, visible |
+| `1x00000000000000000000BB` | Always passes, invisible |
+| `3x00000000000000000000FF` | Forces an interactive challenge |
+
+| Secret key | Behaviour |
+| --- | --- |
+| `1x0000000000000000000000000000000AA` | Always passes |
+| `2x0000000000000000000000000000000AA` | Always fails |
+| `3x0000000000000000000000000000000AA` | Returns `timeout-or-duplicate` |
+
+Dummy sitekeys mint `XXXX.DUMMY.TOKEN.XXXX`, which production secrets reject — so
+a test suite that accidentally runs against production keys fails loudly rather
+than passing for the wrong reason.
+
+The tests worth writing are the negative ones. Submit with no token. Submit with
+a garbage token. Submit the same token twice. Point the handler at the
+always-fails secret and confirm the endpoint returns 403 and did not perform the
+action. That last one is the test that would have caught every broken integration
+in this post.
+
+## Reference
+
+Cloudflare:
+
+- [Server-side validation](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)
+- [Client-side rendering](https://developers.cloudflare.com/turnstile/get-started/client-side-rendering/)
+- [Hostname management](https://developers.cloudflare.com/turnstile/concepts/hostname-management/)
+- [Token validation analytics](https://developers.cloudflare.com/turnstile/turnstile-analytics/token-validation/)
+- [Rotating a secret key](https://developers.cloudflare.com/turnstile/troubleshooting/rotate-secret-key/)
+- [Ephemeral IDs](https://developers.cloudflare.com/turnstile/concepts/ephemeral-id/)
+- [Testing with dummy keys](https://developers.cloudflare.com/turnstile/troubleshooting/testing/)
+- [Client-side error codes](https://developers.cloudflare.com/turnstile/reference/client-side-errors/)
+
+Background:
+
+- [OWASP Automated Threats to Web Applications](https://owasp.github.io/www-project-automated-threats-to-web-applications/) — the OAT identifiers used above
+- [OWASP Top 10 for LLM Applications, LLM10:2025 Unbounded Consumption](https://genai.owasp.org/llmrisk/llm102025-unbounded-consumption/)
+- [Spamhaus, *Subscription Bombing: COI, CAPTCHA, and the Next Generation of Mail Bombs*](https://www.spamhaus.org/resource-hub/threat-intelligence/subscription-bombing-coi-captcha-and-the-next-generation-of-mail-bombs/)
+- Motoyama et al., [*Re: CAPTCHAs — Understanding CAPTCHA-Solving Services in an Economic Context*](https://www.usenix.org/legacy/events/sec10/tech/full_papers/Motoyama.pdf), USENIX Security 2010
