@@ -17,3 +17,26 @@ allowBuilds:
   protobufjs: true
   sharp: true
   workerd: true
+
+# Supply-chain guard: refuse dependency versions published less than 24h
+# (1440 min) ago. A freshly published package that turns out to be compromised
+# is usually caught and yanked within that window, so waiting a day before we
+# ever resolve it into the lockfile is cheap insurance.
+#
+# This lives in the repo (not just a personal machine config) on purpose: it is
+# what stops a CI job or an automated agent — neither of which carries a
+# developer's local pnpm settings — from quietly resolving a same-day release
+# into pnpm-lock.yaml, which then fails to install for anyone who *does* enforce
+# the policy. Enforced here, every environment resolves under the same rule.
+#
+# Exclusions: Cloudflare's first-party toolchain ships same-day releases in
+# lockstep (wrangler/miniflare/workerd/vite-plugin move together), and it is the
+# same vendor already hosting the site — a 24h delay there buys little and would
+# block every routine `wrangler` bump. The long tail of third-party transitive
+# deps, where a supply-chain attack is far likelier to land, keeps full cover.
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  - '@cloudflare/*'
+  - wrangler
+  - miniflare
+  - workerd
