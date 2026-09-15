@@ -2,7 +2,7 @@
   "seo": {
     "title": "Aron Creates",
     "description": "Notes, logs, and things I build.",
-    "siteOwner": "Áron Bodogai",
+    "siteOwner": "Áron",
     "logo": "/favicon.svg"
   },
   "nav": [
@@ -24,6 +24,11 @@
       "title": "GitHub",
       "link": "https://github.com/aronbodogai",
       "icon": "tabler:brand-github"
+    },
+    {
+      "title": "LinkedIn",
+      "link": "https://www.linkedin.com/in/aron-bodogai/",
+      "icon": "tabler:brand-linkedin"
     }
   ]
 }
