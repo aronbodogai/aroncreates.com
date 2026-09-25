@@ -29,11 +29,14 @@ async function getAdapter() {
 	return nodeStandalone();
 }
 
-// Cloudflare Workers injects no deploy-URL variable, so SITE_URL has to be set
-// in the build environment or the sitemap, RSS, and OpenGraph tags all emit
-// localhost canonicals. Local builds fall back to localhost on purpose.
+// Cloudflare Workers injects no deploy-URL variable, so CI builds default to
+// the production origin; relying on a dashboard SITE_URL alone let the
+// sitemap, RSS, and OpenGraph tags ship localhost canonicals when it was
+// missing. SITE_URL still overrides. Local builds fall back to localhost on
+// purpose.
 function getSiteUrl() {
-	return process.env.SITE_URL ?? 'http://localhost:4321';
+	if (process.env.SITE_URL) return process.env.SITE_URL;
+	return process.env.WORKERS_CI ? 'https://aroncreates.com' : 'http://localhost:4321';
 }
 
 // https://astro.build/config

@@ -43,9 +43,10 @@ Cloudflare Workers Builds deploys `main` on push. It needs:
 
 - **Build command** `pnpm build`
 - **Deploy command** `npx wrangler deploy`
-- **`SITE_URL=https://aroncreates.com`** in the build environment — Workers
-  injects no deploy-URL variable, so without it the sitemap, RSS, and OpenGraph
-  tags emit `localhost` canonicals.
+- Nothing else. Workers injects no deploy-URL variable, so `astro.config.mjs`
+  uses `https://aroncreates.com` as the canonical origin whenever `WORKERS_CI`
+  is set. Set `SITE_URL` in the build environment only to override it (for
+  example, a staging domain).
 
 `wrangler.jsonc` serves `./dist` from the asset store and falls through to
 `dist/_worker.js` for the one on-demand route (`/tina-island`, which backs
