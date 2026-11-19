@@ -125,8 +125,10 @@ export default function csp({ directives, reportOnly = true, reportUri }) {
 // Astro emits bundled scripts exactly in this shape. Anything else with a
 // `src` is left alone and reported by the warning above.
 const EXTERNAL_MODULE_SCRIPT = /<script type="module" src="([^"<>]+)"><\/script>/g;
-const SCRIPT = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
-const STYLE = /<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi;
+// End tags as the HTML parser reads them: the tag name followed by whitespace,
+// `/` or `>`, then anything up to `>` (`</script foo>` still closes the element).
+const SCRIPT = /<script\b([^>]*)>([\s\S]*?)<\/script(?=[\s/>])[^>]*>/gi;
+const STYLE = /<style\b[^>]*>([\s\S]*?)<\/style(?=[\s/>])[^>]*>/gi;
 // Only inside a tag: text such as a code sample is escaped (`&lt;`), so it
 // never starts with a literal `<`.
 const EVENT_HANDLER_ATTR = /<[a-z][^>]*?\s(on[a-z]+)\s*=/gi;
