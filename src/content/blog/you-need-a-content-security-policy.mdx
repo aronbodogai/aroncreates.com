@@ -1,0 +1,373 @@
+---
+title: You need a Content Security Policy
+description: What a CSP actually stops, why allowlist policies mostly don't, how to write a strict one, how to roll it out without breaking production, and the checklist I use when reviewing someone else's.
+pubDate: 2026-11-19T00:00:00.000Z
+---
+
+This started as an internal explainer I wrote at work. A missing response header
+was costing us points on an external security rating, the payment pages had a
+PCI deadline coming, and the same question kept arriving: what is this header,
+and why do we need it? This is that explainer, cleaned up, with the parts I got
+wrong the first time fixed.
+
+## What it is
+
+Content Security Policy is an HTTP response header. The server uses it to tell
+the browser which sources are legitimate for each kind of content on the page —
+scripts, styles, images, frames, fonts, network connections — and the browser
+refuses everything else.
+
+```http
+Content-Security-Policy: script-src 'self' https://cdn.example.net; object-src 'none'
+```
+
+The browser enforces it, not your server. That is the whole point: it is a
+control that still works after something has already gone wrong upstream.
+
+## What it defends against
+
+The attack is script running in your visitor's browser that you did not mean to
+ship. In practice that arrives three ways:
+
+- **XSS.** Someone gets markup into your page through input you failed to
+  escape, and a `<script>` or an `onerror=` handler comes along with it.
+- **A compromised third party.** One of the twenty tags marketing added is
+  serving something new today. This is how card skimmers end up on checkout
+  pages.
+- **A tampered page.** Someone with write access to the HTML adds
+  `<script src="https://bad.example/miner.js">`.
+
+With a policy in place, the injected script is not loaded or not executed, and
+the browser can tell you it happened.
+
+It is equally important to know what CSP does not do:
+
+- It does not fix the XSS. The injection is still there; CSP stops the payload
+  from being useful. Output encoding is still your first line.
+- It is not a defence against full server compromise. If the attacker can write
+  files under your origin and your policy trusts `'self'`, they host the script
+  on your origin.
+- It does not stop data being sent anywhere your policy already allows. An
+  allowed analytics endpoint is an allowed exfiltration endpoint.
+
+## Why you will be asked for one
+
+Two reasons usually arrive before the security argument does.
+
+**Security ratings.** External rating platforms such as Bitsight score your
+public web headers, and a missing or weak CSP is one of the line items. Whatever
+you think of the scoring, it ends up in vendor questionnaires and cyber
+insurance conversations.
+
+**PCI DSS 4.0.** Two requirements aimed at exactly the skimming scenario above
+became mandatory on 31 March 2025:
+
+- **6.4.3** — every script loaded and executed on a payment page in the
+  consumer's browser must be authorised, have its integrity assured, and be in
+  an inventory with a written justification.
+- **11.6.1** — a change- and tamper-detection mechanism must alert on
+  unauthorised changes to the security-relevant HTTP headers and the script
+  contents of payment pages, as the browser receives them.
+
+A CSP with reporting is the usual building block for both: the policy is the
+authorisation, and the reports are the detection. It is not the whole answer —
+6.4.3 still wants the inventory and justification on paper, and a policy alone
+does not prove a script on an allowed host has not changed. How these apply to
+you depends on how your payment page is built and which SAQ you file, so read
+the requirement text with whoever owns your PCI scope rather than a vendor blog.
+
+## The allowlist policy, and why it is weaker than it looks
+
+The first policy most people write looks like the one I added in front of our
+site, at the edge:
+
+```http
+Content-Security-Policy:
+  script-src 'self'
+    https://www.googletagmanager.com
+    https://static.hotjar.com
+    https://widget.trustpilot.com
+    https://s.pinimg.com;
+```
+
+The tampered page from earlier now fails: `bad.example` is not in the list, so
+the browser does not load the miner. An inline `<script>` fails too, because
+there is no `'unsafe-inline'`.
+
+Setting the header at the edge (a Cloudflare response header rule, in that
+case) has one nice property: someone who can edit files on the origin cannot
+also quietly remove the header. It does not stop them dropping a file under
+`'self'`.
+
+The bigger problem is the allowlist itself. Google's 2016 study of real-world
+policies, *CSP Is Dead, Long Live CSP!*, found that 14 of the 15 domains most
+commonly allowlisted for scripts hosted something an attacker could abuse —
+JSONP endpoints that wrap attacker-chosen callbacks in valid JavaScript, old
+versions of front-end frameworks that evaluate templates, user-uploaded
+content. As a result about three quarters of the policies using an allowlist
+could be bypassed. Large analytics and CDN domains are exactly the ones that
+host that sort of thing.
+
+An allowlist tells the browser *where* script may come from. An attacker who
+can inject markup only has to find one useful file on one of those hosts.
+
+## A strict policy
+
+The fix the same paper proposed is to stop trusting hosts and trust specific
+script tags instead. Each response gets a fresh random nonce, the server puts it
+on every script tag it means to ship, and the policy only runs scripts carrying
+it:
+
+```http
+Content-Security-Policy:
+  script-src 'nonce-R4nd0mPerResp0nse' 'strict-dynamic' https: 'unsafe-inline';
+  object-src 'none';
+  base-uri 'none';
+```
+
+```html
+<script nonce="R4nd0mPerResp0nse" src="/app.js"></script>
+```
+
+Injected markup cannot guess the nonce, so injected scripts do not run, whatever
+host they point at.
+
+`'strict-dynamic'` is what makes this survivable with third-party tags: a script
+that was trusted via the nonce may load further scripts, and those are trusted
+too. You nonce the tag manager's loader; whatever it loads runs. That is also
+the trade-off — you are now trusting the tag manager's configuration, so who can
+publish to it becomes a security question.
+
+The `https:` and `'unsafe-inline'` look alarming and are fallbacks for old
+browsers. Browsers that understand nonces ignore `'unsafe-inline'` when a nonce
+is present, and browsers that understand `'strict-dynamic'` ignore host and
+scheme sources. Old browsers get a weaker policy rather than a broken page.
+
+Two rules make or break a nonce policy:
+
+- **The nonce must be new on every response** and unguessable — at least 128
+  bits from a CSPRNG. A nonce baked into a cached HTML page is a constant, and a
+  constant is just a password printed on the page. If you inject it at the edge
+  (a Worker running `HTMLRewriter` over cached HTML works well), inject it after
+  the cache.
+- **No exemptions.** The pressure to loosen the policy on the one route where a
+  widget broke is constant. I wrote about the login-page version of this in
+  [Deploying Cloudflare Turnstile properly](/blog/deploying-cloudflare-turnstile-properly):
+  the widget supports nonces, and adding `'unsafe-inline'` to make it load
+  trades your XSS protection for bot protection on the page that needs both.
+
+For a fully static site where nothing can generate a per-response nonce, use
+hashes instead. `'sha256-…'` of each inline script you ship, with
+`'strict-dynamic'` so those scripts can load the rest. Most static site
+generators can compute these at build time.
+
+## The directives people forget
+
+Most directives fall back to `default-src` when they are not set. These do not,
+and a policy that leaves them out simply does not restrict them:
+
+- **`base-uri`** — without it, injected `<base href>` can redirect every
+  relative script URL on the page. Set `'none'` unless you use `<base>`.
+- **`form-action`** — where forms may submit. Injected markup that rewrites a
+  login form's `action` is a credential theft that never runs a line of script.
+- **`frame-ancestors`** — who may frame your page. This is the modern
+  replacement for `X-Frame-Options`; `'none'` or `'self'` for most sites.
+
+And one that does fall back but is worth stating explicitly: `object-src 'none'`.
+Plugins are dead, but `<object>` and `<embed>` are still a way to load content
+that some policies forget about.
+
+If you deliver the policy in a `<meta http-equiv>` tag instead of a header,
+`frame-ancestors`, `sandbox` and the reporting directives are ignored, and
+report-only mode is not available at all. Use the header.
+
+## Rolling it out without breaking production
+
+Do not ship an enforcing policy to an existing site on day one. Ship it in
+report-only mode, where the browser evaluates the policy, blocks nothing, and
+tells you what it *would* have blocked:
+
+```http
+Reporting-Endpoints: csp="https://example.com/csp-reports"
+Content-Security-Policy-Report-Only:
+  script-src 'nonce-R4nd0mPerResp0nse' 'strict-dynamic';
+  object-src 'none';
+  base-uri 'none';
+  report-to csp;
+  report-uri https://example.com/csp-reports
+```
+
+Two things here that I got wrong in the original note.
+
+`report-to` takes the *name* of an endpoint declared in the `Reporting-Endpoints`
+header, not a URL. `report-uri` takes a URL and is deprecated, but it costs
+nothing to send both: browsers that understand `report-to` ignore `report-uri`,
+and older ones still report.
+
+The two also post different formats. `report-to` sends
+`application/reports+json`, a batched array:
+
+```json
+[
+  {
+    "type": "csp-violation",
+    "url": "https://example.com/signup",
+    "user_agent": "Mozilla/5.0 ...",
+    "body": {
+      "documentURL": "https://example.com/signup",
+      "blockedURL": "https://cdn.example.net/style.css",
+      "effectiveDirective": "style-src-elem",
+      "disposition": "report",
+      "originalPolicy": "default-src 'none'; report-to csp",
+      "statusCode": 200
+    }
+  }
+]
+```
+
+`report-uri` sends `application/csp-report`, one violation per request, with
+kebab-case keys:
+
+```json
+{
+  "csp-report": {
+    "document-uri": "https://example.com/signup",
+    "blocked-uri": "https://cdn.example.net/style.css",
+    "effective-directive": "style-src-elem",
+    "violated-directive": "style-src-elem",
+    "disposition": "report",
+    "original-policy": "default-src 'none'; report-uri https://example.com/csp-reports",
+    "status-code": 200
+  }
+}
+```
+
+Your collector needs to accept both.
+
+Some practical notes on the reports themselves:
+
+- **Most of the noise is browser extensions.** They inject scripts into every
+  page and every one is a violation. Filter `chrome-extension:`,
+  `moz-extension:` and `safari-web-extension:` sources before you look at
+  anything else.
+- **Add `'report-sample'`** to `script-src` and `style-src` and reports include
+  the first 40 characters of a blocked inline script, which is usually enough to
+  tell an extension from an injection.
+- **Reports contain URLs.** `documentURL` includes the query string, and query
+  strings carry email addresses, reset tokens and search terms. If the collector
+  is a third-party service, that is personal data leaving your hands. Strip
+  query strings at the collector, or host it yourself.
+- **You can run both headers at once.** Enforce the policy you are confident in
+  and report-only the stricter one you are working towards. This is the
+  steady-state for most sites, not just the migration.
+
+When the report-only stream contains only noise for a couple of weeks across
+real traffic, switch the header name to the enforcing one. Keep the reporting.
+
+## Generating a policy from an existing site
+
+The fastest way to a first draft is a tool that watches your site load and
+writes down every source it saw. There are browser extensions and crawlers that
+do this. The one I used produced something like this for a marketing page:
+
+```http
+script-src 'report-sample' 'self'
+  https://analytics.tiktok.com/i18n/pixel/events.js
+  https://bat.bing.com/bat.js
+  https://connect.facebook.net/en_US/fbevents.js
+  https://js.driftt.com/include/1691745600000/abc123.js
+  https://script.hotjar.com/modules.0a1b2c3d4e5f6a7b8c9d.js
+  https://www.googletagmanager.com/gtag/js;
+connect-src 'self' https://analytics.tiktok.com https://bat.bing.com wss://ws.hotjar.com;
+frame-src 'self' https://js.driftt.com https://widget.trustpilot.com;
+...
+```
+
+It is a useful document and a bad policy. Look at the two script URLs with a
+timestamp and a content hash in the path: they change whenever the vendor
+deploys, and the policy breaks the day after you enforce it. Everything here is
+also an allowlist, with all the problems above, and the generator did not emit
+`form-action` or `frame-ancestors` because it never saw them used.
+
+Treat the output as an **inventory** instead. Every line is a third party
+running code on your page, and somebody should be able to say why. For a payment
+page, that list with a justification next to each entry is most of what 6.4.3
+asks for. Then write the strict policy by hand.
+
+## Keeping it working
+
+A CSP is not a one-off change. Every new third-party tag, embed or font is a
+policy change, so:
+
+- **Keep the policy in version control**, next to the code that needs it, not in
+  a dashboard field only one person knows about. Policy changes should be
+  reviewed like code, because they are.
+- **Make breaking it loud.** Run the enforcing policy in staging and fail the
+  build on violations, so the first person to notice a missing source is the
+  developer who added it, not a customer.
+- **Ask who can publish to anything you trust transitively.** With
+  `'strict-dynamic'`, anyone who can publish a tag manager container can run
+  script on your site. That is an access-control question, not a CSP one.
+
+Once the policy is enforcing and stable, the next step for applications with a
+lot of client-side rendering is Trusted Types
+(`require-trusted-types-for 'script'`), which goes after DOM XSS — the variant
+where your own JavaScript writes attacker data into `innerHTML`. That is a post
+of its own.
+
+## Reviewing someone else's CSP
+
+The questions I ask, roughly in order of how often the answer is bad:
+
+**Is it enforcing?** A report-only policy that has been in report-only for a
+year is a logging feature, not a control.
+
+**Does `script-src` trust hosts or tags?** A host allowlist without nonces or
+hashes is the bypassable kind. Paste it into Google's CSP Evaluator and see what
+it flags.
+
+**Is there `'unsafe-inline'` without a nonce, or `'unsafe-eval'` at all?**
+Either one switches off most of what the policy is for.
+
+**Is the nonce actually random per response?** Fetch the page twice and compare:
+
+```bash
+curl -sI https://example.com | grep -i content-security-policy
+```
+
+If the nonce is the same both times, the policy is decorative.
+
+**Are `object-src`, `base-uri`, `form-action` and `frame-ancestors` set?** None
+of them are covered by a policy that only thinks about scripts.
+
+**Is any route exempt?** Grep the header configuration for path conditions. The
+exempt route is usually the login or checkout page, which is the one that
+matters.
+
+**Is anybody reading the reports?** Ask to see last week's. If nobody can find
+them, the tamper detection is not detecting anything.
+
+**Is every third-party source justified?** Ask what each host is for. Hosts
+nobody can explain are hosts nobody is watching.
+
+## Reference
+
+Specification and documentation:
+
+- [MDN, Content Security Policy guide](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP)
+- [MDN, `Content-Security-Policy` header reference](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy)
+- [MDN, `Reporting-Endpoints`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Reporting-Endpoints)
+- [W3C, Content Security Policy Level 3](https://www.w3.org/TR/CSP3/)
+- [web.dev, Mitigate XSS with a strict CSP](https://web.dev/articles/strict-csp)
+- [Chrome for Developers, Migrate to Reporting API v1](https://developer.chrome.com/blog/reporting-api-migration)
+- [Cloudflare, Response header transform rules](https://developers.cloudflare.com/rules/transform/response-header-modification/)
+
+Tools:
+
+- [Google CSP Evaluator](https://csp-evaluator.withgoogle.com/)
+
+Background:
+
+- Weichselbaum, Spagnuolo, Lekies and Janc, [*CSP Is Dead, Long Live CSP! On the Insecurity of Whitelists and the Future of Content Security Policy*](https://research.google.com/pubs/pub45542.html), ACM CCS 2016
+- [Bitsight, Proper Content Security Policy (CSP) implementation](https://help.bitsighttech.com/hc/en-us/articles/360009007754-Proper-Content-Security-Policy-CSP-Implementation)
+- [PCI Security Standards Council document library](https://www.pcisecuritystandards.org/document_library/) — PCI DSS v4.0.1, requirements 6.4.3 and 11.6.1
