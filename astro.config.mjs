@@ -6,6 +6,7 @@ import icon from 'astro-icon';
 import tina from '@tinacms/astro/integration';
 import { tinaAdminDevRedirect } from '@tinacms/astro/vite';
 import tailwindcss from '@tailwindcss/vite';
+import csp from './src/integrations/csp.mjs';
 
 // Every content page prerenders to static HTML; the one on-demand route
 // (/tina-island, the visual-editing endpoint) needs a server. Cloudflare
@@ -45,7 +46,39 @@ export default defineConfig({
 	output: 'static',
 	adapter: await getAdapter(),
 	redirects: { '/home': '/' },
-	integrations: [mdx(), sitemap(), icon(), tina()],
+	integrations: [
+		mdx(),
+		sitemap(),
+		icon(),
+		tina(),
+		// Strict, hash-based CSP written into dist/client/_headers at build time.
+		// Report-only for now; README.md lists the steps to enforce it.
+		csp({
+			reportOnly: true,
+			directives: {
+				'default-src': ["'self'"],
+				// Hashes of every inline script are appended. 'strict-dynamic' lets
+				// those scripts load the rest; browsers that support it ignore the
+				// https: and 'unsafe-inline' fallbacks, which exist for old ones.
+				'script-src': ["'strict-dynamic'", "'report-sample'", 'https:', "'unsafe-inline'"],
+				// Hash of the inlined stylesheet is appended (build.inlineStylesheets).
+				'style-src': ["'self'", "'report-sample'"],
+				// Shiki colours tokens, and the starfield and YouTube facade set
+				// per-element values, with style="" attributes.
+				'style-src-attr': ["'unsafe-inline'"],
+				// i.ytimg.com: YouTube facade poster (CSS background-image).
+				'img-src': ["'self'", 'https://i.ytimg.com'],
+				'font-src': ["'self'"],
+				'connect-src': ["'self'"],
+				// The facade swaps in the youtube-nocookie player on click.
+				'frame-src': ['https://www.youtube-nocookie.com'],
+				'object-src': ["'none'"],
+				'base-uri': ["'none'"],
+				'form-action': ["'self'"],
+				'frame-ancestors': ["'none'"],
+			},
+		}),
+	],
 	build: {
 		// Inline the (~10 KiB) bundled CSS into a <style> in <head> instead of a
 		// separate render-blocking <link>. Astro's default ('auto') only inlines
