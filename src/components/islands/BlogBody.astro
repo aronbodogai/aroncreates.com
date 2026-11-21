@@ -3,6 +3,7 @@ import TinaMarkdown from '@tinacms/astro/TinaMarkdown.astro';
 import { tinaField } from '@tinacms/astro/tina-field';
 import type { CmsBlog } from '../../lib/data';
 import FormattedDate from '../FormattedDate.astro';
+import NarrationPlayer from '../NarrationPlayer.astro';
 import { mdxComponents } from '../mdx/components';
 
 interface Props {
@@ -29,6 +30,7 @@ const { data } = Astro.props;
 			)}
 			{data.title && <h1 data-tina-field={tinaField(data, 'title')} class="mt-2 text-4xl font-semibold tracking-tight lg:text-5xl">{data.title}</h1>}
 		</div>
+		<NarrationPlayer slug={data._sys.filename} title={data.title ?? ''} />
 		{data.body && (
 			<div data-tina-field={tinaField(data, 'body')} class="prose prose-lg max-w-none">
 				<TinaMarkdown content={data.body} components={mdxComponents} />

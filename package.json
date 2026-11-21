@@ -10,7 +10,8 @@
     "build": "tinacms build --local --skip-cloud-checks -c \"astro build\" && pnpm strip-admin",
     "strip-admin": "node -e \"const{rmSync}=require('node:fs');for(const d of ['dist/client/admin','dist/admin'])rmSync(d,{recursive:true,force:true})\"",
     "preview": "astro preview",
-    "astro": "astro"
+    "astro": "astro",
+    "tts": "node scripts/tts/generate.mjs"
   },
   "dependencies": {
     "@astrojs/cloudflare": "^13.7.0",
@@ -37,9 +38,15 @@
     "@types/node": "^25.9.1",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
+    "remark-frontmatter": "^5.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-mdx": "^3.1.1",
+    "remark-parse": "^11.0.0",
     "tinacms": "^3.10.0",
     "typescript": "^6.0.3",
+    "unified": "^11.0.5",
     "vite": "^7.3.2",
-    "wrangler": "^4.131.2"
+    "wrangler": "^4.131.2",
+    "yaml": "^2.9.1"
   }
 }
