@@ -1,0 +1,210 @@
+---
+/**
+ * Player for a post's pre-generated narration (see scripts/tts). Renders
+ * nothing when the post has no audio in src/data/blog-audio.json.
+ *
+ * `preload="none"` keeps the MP3 off the network until someone presses
+ * play; the duration comes from the manifest so it can be shown up front.
+ */
+import { Icon } from 'astro-icon/components';
+import manifest from '../data/blog-audio.json';
+
+interface Props {
+	slug: string;
+	title: string;
+}
+
+const { slug, title } = Astro.props;
+const audio = (manifest as Record<string, { src: string; duration: number }>)[slug];
+const src = audio && `/listen/${audio.src.split('/').pop()}`;
+const minutes = audio ? Math.max(1, Math.round(audio.duration / 60)) : 0;
+const control =
+	'inline-flex shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors outline-none hover:bg-accent hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50';
+---
+
+{audio && (
+	<narration-player class="mb-10 block" data-duration={audio.duration} data-title={title}>
+		<div class="flex items-center gap-2 rounded-xl border bg-card p-2.5 text-card-foreground shadow-xs sm:gap-3">
+			<button
+				type="button"
+				data-play
+				aria-label="Play narration"
+				class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded-full bg-primary text-primary-foreground shadow-xs transition-colors outline-none hover:bg-primary/90 focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+			>
+				<Icon name="tabler:player-play-filled" data-icon="play" class="size-5 translate-x-px" />
+				<Icon name="tabler:player-pause-filled" data-icon="pause" class="hidden size-5" />
+			</button>
+			<div class="min-w-0 flex-1 pl-1">
+				<div class="flex items-baseline justify-between gap-3 text-sm">
+					<span class="truncate font-medium">Listen<span class="hidden sm:inline"> to this post</span></span>
+					<span data-time class="shrink-0 text-muted-foreground tabular-nums">{minutes} min</span>
+				</div>
+				<input
+					data-seek
+					type="range"
+					min="0"
+					max={Math.floor(audio.duration)}
+					step="1"
+					value="0"
+					aria-label="Position"
+					class="mt-1 block h-4 w-full cursor-pointer accent-primary"
+				/>
+			</div>
+			<button type="button" data-back aria-label="Back 15 seconds" class:list={[control, 'size-9']}>
+				<Icon name="tabler:rewind-backward-15" class="size-5" />
+			</button>
+			<button type="button" data-rate aria-label="Playback speed 1×" class:list={[control, 'h-9 min-w-11 px-1.5 text-sm font-medium tabular-nums']}>1×</button>
+		</div>
+		<p class="mt-2 px-1 text-xs text-muted-foreground">Read by an AI voice from the text below. Code samples are skipped.</p>
+		<audio preload="none" src={src}></audio>
+	</narration-player>
+	<noscript>
+		<style>narration-player { display: none !important; }</style>
+		<audio controls preload="none" src={src} class="mb-10 w-full"></audio>
+	</noscript>
+)}
+
+<script>
+	const RATES = [1, 1.25, 1.5, 1.75, 2, 0.75];
+	const RATE_KEY = 'narration:rate';
+
+	// Storage can be unavailable (private mode, blocked site data); the player
+	// works without it, it just forgets your place.
+	const store = {
+		get(key: string) {
+			try {
+				return localStorage.getItem(key);
+			} catch {
+				return null;
+			}
+		},
+		set(key: string, value: string | null) {
+			try {
+				if (value === null) localStorage.removeItem(key);
+				else localStorage.setItem(key, value);
+			} catch {}
+		},
+	};
+
+	const clock = (s: number) => {
+		s = Math.max(0, Math.floor(s));
+		const h = Math.floor(s / 3600);
+		const m = Math.floor((s % 3600) / 60);
+		const sec = String(s % 60).padStart(2, '0');
+		return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+	};
+	const plural = (n: number, unit: string) => `${n} ${unit}${n === 1 ? '' : 's'}`;
+	const spoken = (s: number) => `${plural(Math.floor(s / 60), 'minute')} ${plural(Math.floor(s % 60), 'second')}`;
+
+	class NarrationPlayer extends HTMLElement {
+		#ready = false;
+
+		connectedCallback() {
+			if (this.#ready) return;
+			this.#ready = true;
+
+			const audio = this.querySelector('audio')!;
+			const play = this.querySelector<HTMLButtonElement>('[data-play]')!;
+			const seek = this.querySelector<HTMLInputElement>('[data-seek]')!;
+			const time = this.querySelector<HTMLElement>('[data-time]')!;
+			const back = this.querySelector<HTMLButtonElement>('[data-back]')!;
+			const rate = this.querySelector<HTMLButtonElement>('[data-rate]')!;
+			const icons = {
+				play: this.querySelector('[data-icon="play"]')!,
+				pause: this.querySelector('[data-icon="pause"]')!,
+			};
+			const total = Number(this.dataset.duration);
+			// The file name carries a content hash, so a regenerated post starts fresh.
+			const positionKey = `narration:${audio.getAttribute('src')}`;
+			let dragging = false;
+			let lastSaved = 0;
+
+			const render = (t: number) => {
+				seek.value = String(Math.floor(t));
+				seek.setAttribute('aria-valuetext', `${spoken(t)} of ${spoken(total)}`);
+				time.textContent = `${clock(t)} / ${clock(total)}`;
+			};
+			const jump = (t: number) => {
+				t = Math.min(Math.max(0, t), total);
+				audio.currentTime = t;
+				render(t);
+			};
+			const setRate = (r: number) => {
+				audio.defaultPlaybackRate = audio.playbackRate = r;
+				rate.textContent = `${r}×`;
+				rate.setAttribute('aria-label', `Playback speed ${r}×`);
+			};
+
+			setRate(RATES.includes(Number(store.get(RATE_KEY))) ? Number(store.get(RATE_KEY)) : 1);
+			const resume = Number(store.get(positionKey)) || 0;
+			if (resume > 5 && resume < total - 5) jump(resume);
+
+			play.addEventListener('click', () => (audio.paused ? audio.play().catch(() => {}) : audio.pause()));
+			back.addEventListener('click', () => jump(Number(seek.value) - 15));
+			rate.addEventListener('click', () => {
+				const next = RATES[(RATES.indexOf(audio.playbackRate) + 1) % RATES.length];
+				setRate(next);
+				store.set(RATE_KEY, String(next));
+			});
+
+			seek.addEventListener('input', () => {
+				dragging = true;
+				render(Number(seek.value));
+			});
+			seek.addEventListener('change', () => {
+				dragging = false;
+				jump(Number(seek.value));
+			});
+
+			const setPlaying = (playing: boolean) => {
+				icons.play.classList.toggle('hidden', playing);
+				icons.pause.classList.toggle('hidden', !playing);
+				play.setAttribute('aria-label', playing ? 'Pause narration' : 'Play narration');
+			};
+			audio.addEventListener('play', () => {
+				setPlaying(true);
+				mediaSession(audio, this.dataset.title ?? document.title, jump);
+			});
+			audio.addEventListener('pause', () => {
+				setPlaying(false);
+				store.set(positionKey, String(Math.floor(audio.currentTime)));
+			});
+			audio.addEventListener('timeupdate', () => {
+				if (!dragging) render(audio.currentTime);
+				if (Math.abs(audio.currentTime - lastSaved) >= 5) {
+					lastSaved = audio.currentTime;
+					store.set(positionKey, String(Math.floor(lastSaved)));
+				}
+			});
+			audio.addEventListener('ended', () => {
+				store.set(positionKey, null);
+				setPlaying(false);
+			});
+			audio.addEventListener('error', () => {
+				setPlaying(false);
+				play.disabled = true;
+				time.textContent = 'Audio unavailable';
+			});
+		}
+	}
+
+	/** Lock-screen and headset controls. */
+	function mediaSession(audio: HTMLAudioElement, title: string, jump: (t: number) => void) {
+		if (!('mediaSession' in navigator)) return;
+		navigator.mediaSession.metadata = new MediaMetadata({ title, artist: location.hostname });
+		const handlers: [MediaSessionAction, MediaSessionActionHandler][] = [
+			['play', () => audio.play()],
+			['pause', () => audio.pause()],
+			['seekbackward', (d) => jump(audio.currentTime - (d.seekOffset ?? 15))],
+			['seekforward', (d) => jump(audio.currentTime + (d.seekOffset ?? 15))],
+			['seekto', (d) => d.seekTime !== undefined && jump(d.seekTime)],
+		];
+		for (const [action, handler] of handlers) {
+			try {
+				navigator.mediaSession.setActionHandler(action, handler);
+			} catch {}
+		}
+	}
+
+	if (!customElements.get('narration-player')) customElements.define('narration-player', NarrationPlayer);
+</script>
