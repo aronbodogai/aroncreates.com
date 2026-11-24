@@ -56,6 +56,45 @@ visual editing and is inert in production).
 Node server otherwise, so a local `pnpm build && pnpm preview` still works.
 Override with `DEPLOY_ADAPTER`.
 
+## Content Security Policy
+
+The site sends a strict, hash-based CSP, currently as
+`Content-Security-Policy-Report-Only`. The directives live in
+`astro.config.mjs`; `src/integrations/csp.mjs` does the rest after
+`astro build`:
+
+- every inline `<script>` and `<style>` in the built HTML is hashed into
+  `script-src` / `style-src`, so editing an `is:inline` script or the CSS needs
+  no manual step;
+- the bundled `<script type="module" src>` tags are swapped for a small hashed
+  loader, because `'strict-dynamic'` only trusts scripts that a trusted script
+  creates, not external tags in the markup;
+- the header is appended to `dist/client/_headers`, which Workers applies to
+  static asset responses (not to responses the Worker itself generates).
+
+Things that need a policy change rather than just a rebuild: a new image host
+(`img-src`), a new embed such as a Vimeo URL in the Video block (`frame-src`),
+and inline `on…=` handler attributes, which are not allowed at all. The build
+warns about the last one and about external scripts it cannot cover.
+
+### Switching to enforcing
+
+1. Add a reporting endpoint: set `reportUri` in the `csp()` options. That adds
+   `Reporting-Endpoints`, `report-to` and `report-uri`. Not chosen yet.
+2. Leave it in report-only for a couple of weeks of real traffic. Check the
+   header is live with
+   `curl -sI https://aroncreates.com/ | grep -i content-security`, and open the
+   home page, a post with code blocks and a page with a YouTube embed in
+   Chrome, Firefox and Safari with the console open. There should be no
+   `[Report Only]` messages.
+3. Triage the reports. Ignore browser-extension noise (`chrome-extension:`,
+   `moz-extension:`, `safari-web-extension:` blocked URLs); fix anything else
+   by adding the source in `astro.config.mjs` or moving the code into a bundled
+   script.
+4. Set `reportOnly: false`, run `pnpm build`, confirm
+   `dist/client/_headers` now says `Content-Security-Policy:`, and push. Keep
+   the reporting on.
+
 ## Notes
 
 - `public/og-default.jpg` is the fallback OpenGraph image, inherited from the
